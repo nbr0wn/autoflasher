@@ -3,13 +3,10 @@ use log::{error, info, warn};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
-use std::io::{self, BufRead, BufReader, Read, Write};
-use std::os::unix::fs::OpenOptionsExt;
+use std::io::{self, BufRead, BufReader, Write};
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
-use std::thread;
+use std::process::{Child, Command};
 
 /// Monitors udev for storage media insertions and automatically writes an image using dd.
 #[derive(Parser, Debug)]
@@ -111,6 +108,15 @@ struct MonitorConfig {
     show_partitions: bool,
     verbose: bool,
     flash: Option<FlashConfig>,
+}
+
+/// A dd child process writing to a device.
+struct InFlightOp {
+    child: Child,
+    devnode: PathBuf,
+    image: PathBuf,
+    skip_verify: bool,
+    once: bool,
 }
 
 fn main() {
@@ -259,6 +265,58 @@ fn enumerate_existing_devices() -> Result<HashSet<DeviceKey>, Box<dyn std::error
     Ok(existing)
 }
 
+/// Reap finished dd processes: log results and run verification.
+fn reap_children(in_flight: &mut HashMap<String, InFlightOp>) -> bool {
+    let mut finished: Vec<String> = Vec::new();
+    let mut got_once = false;
+
+    for (dev, op) in in_flight.iter_mut() {
+        match op.child.try_wait() {
+            Ok(Some(status)) => {
+                finished.push(dev.clone());
+                if !status.success() {
+                    error!(
+                        "Failed to write to {}: dd exited with status {}",
+                        dev,
+                        status.code().map_or("signal".to_string(), |c| c.to_string())
+                    );
+                    continue;
+                }
+                info!("Successfully wrote image to {}", dev);
+
+                if !op.skip_verify {
+                    info!("Verifying written image on {}...", dev);
+                    match verify_image(&op.image, &op.devnode) {
+                        Ok(true) => info!("Verification PASSED for {}", dev),
+                        Ok(false) => {
+                            error!(
+                                "Verification FAILED for {} — checksums do not match!",
+                                dev
+                            )
+                        }
+                        Err(e) => error!("Verification error for {}: {}", dev, e),
+                    }
+                }
+
+                if op.once {
+                    got_once = true;
+                }
+            }
+            Ok(None) => {} // still running
+            Err(e) => {
+                finished.push(dev.clone());
+                error!("Error waiting on dd for {}: {}", dev, e);
+            }
+        }
+    }
+
+    for dev in finished {
+        in_flight.remove(&dev);
+    }
+
+    got_once
+}
+
 fn monitor(config: &MonitorConfig) -> Result<(), Box<dyn std::error::Error>> {
     let protected = enumerate_existing_devices()?;
 
@@ -274,18 +332,32 @@ fn monitor(config: &MonitorConfig) -> Result<(), Box<dyn std::error::Error>> {
     // removal events for devices we previously reported.
     let mut reported_devices: HashSet<String> = HashSet::new();
 
-    // Shared state for concurrent flash operations.
-    // Devices currently being flashed — prevents double-writes if events repeat.
-    let in_flight: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
-    // Signal for --once: any thread that finishes successfully sets this.
-    let done = Arc::new(AtomicBool::new(false));
+    // Running dd child processes, keyed by device path.
+    let mut in_flight: HashMap<String, InFlightOp> = HashMap::new();
 
     info!("Listening for udev block device events... (Ctrl+C to quit)");
 
+    // The udev MonitorSocket is non-blocking, so socket.iter() returns None
+    // immediately when there are no pending events. Use poll() to sleep until
+    // the kernel actually delivers an event, instead of busy-spinning.
+    let socket_fd = socket.as_raw_fd();
+
     loop {
-        if done.load(Ordering::SeqCst) {
+        // Reap any finished dd processes
+        if reap_children(&mut in_flight) {
             info!("--once flag set, exiting after first successful write.");
             return Ok(());
+        }
+
+        // Block until the socket has data (or 1s timeout to reap children)
+        let mut pfd = libc::pollfd {
+            fd: socket_fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let ret = unsafe { libc::poll(&mut pfd, 1, 1000) };
+        if ret <= 0 {
+            continue;
         }
 
         for event in socket.iter() {
@@ -450,16 +522,13 @@ fn monitor(config: &MonitorConfig) -> Result<(), Box<dyn std::error::Error>> {
                     continue;
                 }
 
-                // Skip if another thread is already writing to this device
-                {
-                    let mut flight = in_flight.lock().unwrap();
-                    if !flight.insert(dev_str.clone()) {
-                        info!("  Already flashing {}, skipping", dev_str);
-                        continue;
-                    }
+                // Skip if dd is already writing to this device
+                if in_flight.contains_key(&dev_str) {
+                    info!("  Already flashing {}, skipping", dev_str);
+                    continue;
                 }
 
-                // Confirmation — handled here in the main loop, not in the thread
+                // Confirmation
                 if !flash.no_confirm {
                     print!(
                         "\nWrite {} to {}? [y/N]: ",
@@ -473,61 +542,39 @@ fn monitor(config: &MonitorConfig) -> Result<(), Box<dyn std::error::Error>> {
 
                     if !input.trim().eq_ignore_ascii_case("y") {
                         info!("Skipped writing to {}", dev_str);
-                        in_flight.lock().unwrap().remove(&dev_str);
                         continue;
                     }
                 }
 
-                let image = flash.image.clone();
-                let skip_verify = flash.skip_verify;
-                let bs = flash.bs.clone();
-                let once = flash.once;
-                let devnode = devnode.clone();
-                let dev_str = dev_str.clone();
-                let in_flight = Arc::clone(&in_flight);
-                let done = Arc::clone(&done);
+                let image_size = fs::metadata(&flash.image)?.len();
+                info!(
+                    "Writing {} ({} bytes) -> {} (bs={})",
+                    flash.image.display(),
+                    image_size,
+                    dev_str,
+                    flash.bs
+                );
 
-                thread::spawn(move || {
-                    let _cleanup = InFlightGuard {
-                        in_flight: Arc::clone(&in_flight),
-                        dev: dev_str.clone(),
-                    };
+                // Fork+exec dd directly — no threads.
+                let child = Command::new("dd")
+                    .arg(format!("if={}", flash.image.display()))
+                    .arg(format!("of={}", devnode.display()))
+                    .arg(format!("bs={}", flash.bs))
+                    .arg("conv=fdatasync")
+                    .arg("status=progress")
+                    .stdin(std::process::Stdio::null())
+                    .spawn()?;
 
-                    // Do the write
-                    match flash_device(&image, &devnode, &bs) {
-                        Ok(()) => {
-                            info!("Successfully wrote image to {}", dev_str);
-                        }
-                        Err(e) => {
-                            error!("Failed to write to {}: {}", dev_str, e);
-                            return;
-                        }
-                    }
-
-                    if !skip_verify {
-                        info!("Verifying written image on {}...", dev_str);
-                        match verify_image(&image, &devnode) {
-                            Ok(true) => info!("Verification PASSED for {}", dev_str),
-                            Ok(false) => {
-                                error!(
-                                    "Verification FAILED for {} — checksums do not match!",
-                                    dev_str
-                                )
-                            }
-                            Err(e) => error!("Verification error for {}: {}", dev_str, e),
-                        }
-                    }
-
-                    if once {
-                        done.store(true, Ordering::SeqCst);
-                    }
-                });
-            }
-
-            // Check if a --once thread signaled completion
-            if done.load(Ordering::SeqCst) {
-                info!("--once flag set, exiting after first successful write.");
-                return Ok(());
+                in_flight.insert(
+                    dev_str.clone(),
+                    InFlightOp {
+                        child,
+                        devnode: devnode.clone(),
+                        image: flash.image.clone(),
+                        skip_verify: flash.skip_verify,
+                        once: flash.once,
+                    },
+                );
             }
         }
     }
@@ -641,271 +688,6 @@ fn log_device_info_verbose(event: &udev::Event) {
             );
         }
     }
-}
-
-/// Page-aligned buffer for O_DIRECT I/O.
-struct AlignedBuf {
-    ptr: *mut u8,
-    len: usize,
-}
-
-// SAFETY: The buffer is exclusively owned and not shared.
-unsafe impl Send for AlignedBuf {}
-
-impl AlignedBuf {
-    fn new(len: usize, align: usize) -> Result<Self, Box<dyn std::error::Error>> {
-        let mut ptr: *mut libc::c_void = std::ptr::null_mut();
-        let ret = unsafe { libc::posix_memalign(&mut ptr, align, len) };
-        if ret != 0 {
-            return Err(format!("posix_memalign failed: {}", ret).into());
-        }
-        // Zero-initialize
-        unsafe { std::ptr::write_bytes(ptr as *mut u8, 0, len) };
-        Ok(Self {
-            ptr: ptr as *mut u8,
-            len,
-        })
-    }
-}
-
-impl Drop for AlignedBuf {
-    fn drop(&mut self) {
-        unsafe { libc::free(self.ptr as *mut libc::c_void) };
-    }
-}
-
-impl std::ops::Deref for AlignedBuf {
-    type Target = [u8];
-    fn deref(&self) -> &[u8] {
-        unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
-    }
-}
-
-impl std::ops::DerefMut for AlignedBuf {
-    fn deref_mut(&mut self) -> &mut [u8] {
-        unsafe { std::slice::from_raw_parts_mut(self.ptr, self.len) }
-    }
-}
-
-/// RAII guard that removes a device from the in-flight set when dropped,
-/// ensuring cleanup even if the flash thread panics.
-struct InFlightGuard {
-    in_flight: Arc<Mutex<HashSet<String>>>,
-    dev: String,
-}
-
-impl Drop for InFlightGuard {
-    fn drop(&mut self) {
-        self.in_flight.lock().unwrap().remove(&self.dev);
-    }
-}
-
-/// Parse a human-readable block size string (e.g. "256M", "4K", "1G", "512") into bytes.
-fn parse_block_size(bs: &str) -> Result<usize, Box<dyn std::error::Error>> {
-    let bs = bs.trim();
-    let (num_str, multiplier) = match bs.as_bytes().last() {
-        Some(b'K' | b'k') => (&bs[..bs.len() - 1], 1024usize),
-        Some(b'M' | b'm') => (&bs[..bs.len() - 1], 1024 * 1024),
-        Some(b'G' | b'g') => (&bs[..bs.len() - 1], 1024 * 1024 * 1024),
-        _ => (bs, 1),
-    };
-    let n: usize = num_str
-        .parse()
-        .map_err(|_| format!("invalid block size: {}", bs))?;
-    Ok(n * multiplier)
-}
-
-/// Query the kernel for O_DIRECT alignment requirements via statx(STATX_DIOALIGN).
-/// Returns (mem_align, offset_align) in bytes.
-fn dio_alignment(path: &Path) -> Result<(usize, usize), Box<dyn std::error::Error>> {
-    use std::ffi::CString;
-    use std::os::unix::ffi::OsStrExt;
-
-    let c_path = CString::new(path.as_os_str().as_bytes())?;
-
-    // SAFETY: zeroed statx is valid for the syscall to fill in.
-    let mut stx: libc::statx = unsafe { std::mem::zeroed() };
-
-    const STATX_DIOALIGN: libc::c_uint = 0x2000;
-
-    let ret = unsafe {
-        libc::statx(
-            libc::AT_FDCWD,
-            c_path.as_ptr(),
-            0,
-            STATX_DIOALIGN,
-            &mut stx,
-        )
-    };
-    if ret != 0 {
-        return Err(format!(
-            "statx({}) failed: {}",
-            path.display(),
-            io::Error::last_os_error()
-        )
-        .into());
-    }
-
-    if stx.stx_mask & STATX_DIOALIGN == 0 {
-        return Err(format!(
-            "kernel did not return DIOALIGN for {}",
-            path.display()
-        )
-        .into());
-    }
-
-    let mem_align = stx.stx_dio_mem_align as usize;
-    let offset_align = stx.stx_dio_offset_align as usize;
-
-    if mem_align == 0 || offset_align == 0 {
-        return Err(format!(
-            "device {} does not support O_DIRECT (alignment is 0)",
-            path.display()
-        )
-        .into());
-    }
-
-    Ok((mem_align, offset_align))
-}
-
-/// Write a buffer to a file descriptor at an explicit offset using pwrite(2).
-/// Handles partial writes while maintaining O_DIRECT alignment: if a short write
-/// lands on a mem_align boundary we continue from there; otherwise we copy the
-/// remainder into a fresh aligned bounce buffer and retry.
-fn aligned_pwrite(fd: i32, buf: &[u8], mut offset: u64, mem_align: usize) -> io::Result<()> {
-    let mut pos = 0;
-    while pos < buf.len() {
-        let ptr = buf[pos..].as_ptr();
-        let len = buf.len() - pos;
-        let n = unsafe {
-            libc::pwrite(
-                fd,
-                ptr as *const libc::c_void,
-                len,
-                offset as libc::off_t,
-            )
-        };
-        if n < 0 {
-            let err = io::Error::last_os_error();
-            if err.kind() == io::ErrorKind::Interrupted {
-                continue;
-            }
-            return Err(err);
-        }
-        let n = n as usize;
-        if n == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::WriteZero,
-                "pwrite returned 0",
-            ));
-        }
-        pos += n;
-        offset += n as u64;
-
-        // If there's remaining data and the new buffer pointer isn't aligned,
-        // bounce the remainder through a fresh aligned allocation.
-        if pos < buf.len() && (buf[pos..].as_ptr() as usize) % mem_align != 0 {
-            let remaining = &buf[pos..];
-            let bounce = AlignedBuf::new(remaining.len(), mem_align).map_err(|e| {
-                io::Error::new(io::ErrorKind::Other, e.to_string())
-            })?;
-            // SAFETY: we just allocated bounce with len == remaining.len()
-            unsafe {
-                std::ptr::copy_nonoverlapping(
-                    remaining.as_ptr(),
-                    bounce.ptr,
-                    remaining.len(),
-                );
-            }
-            return aligned_pwrite(fd, &bounce, offset, mem_align);
-        }
-    }
-    Ok(())
-}
-
-fn flash_device(image: &Path, device: &Path, bs: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let block_size = parse_block_size(bs)?;
-    let image_size = fs::metadata(image)?.len();
-    let dev_str = device.to_string_lossy();
-
-    let (mem_align, offset_align) = dio_alignment(device)?;
-    info!(
-        "[{}] O_DIRECT alignment: mem={} bytes, offset={} bytes",
-        dev_str, mem_align, offset_align
-    );
-
-    // Round block_size down to a multiple of offset_align for O_DIRECT writes
-    let block_size = (block_size / offset_align) * offset_align;
-    if block_size == 0 {
-        return Err(format!(
-            "block size is smaller than device offset alignment ({} bytes)",
-            offset_align
-        )
-        .into());
-    }
-
-    info!(
-        "Writing {} ({} bytes) -> {} (bs={})",
-        image.display(),
-        image_size,
-        dev_str,
-        bs
-    );
-
-    let mut src = BufReader::with_capacity(block_size, File::open(image)?);
-    let dst = fs::OpenOptions::new()
-        .write(true)
-        .custom_flags(libc::O_SYNC | libc::O_DIRECT)
-        .open(device)?;
-    let fd = dst.as_raw_fd();
-    let mut file_offset: u64 = 0;
-    let mut written: u64 = 0;
-    let mut buf = AlignedBuf::new(block_size, mem_align)?;
-    let mut next_pct: u64 = 10;
-
-    loop {
-        let mut filled = 0;
-        // Fill the buffer completely (or until EOF)
-        while filled < block_size {
-            let n = src.read(&mut buf[filled..])?;
-            if n == 0 {
-                break;
-            }
-            filled += n;
-        }
-        if filled == 0 {
-            break;
-        }
-
-        // O_DIRECT requires writes to be a multiple of offset_align.
-        // Pad the final chunk with zeros.
-        let mask = offset_align - 1;
-        let write_len = (filled + mask) & !mask;
-        if write_len > filled {
-            buf[filled..write_len].fill(0);
-        }
-        aligned_pwrite(fd, &buf[..write_len], file_offset, mem_align)?;
-        file_offset += write_len as u64;
-        written += filled as u64;
-
-        let pct = if image_size > 0 {
-            written * 100 / image_size
-        } else {
-            100
-        };
-        if pct >= next_pct {
-            info!("[{}] {}% ({:.1} MB / {:.1} MB)", dev_str, next_pct,
-                written as f64 / 1_048_576.0,
-                image_size as f64 / 1_048_576.0,
-            );
-            next_pct += 10;
-        }
-    }
-
-    drop(dst);
-
-    info!("[{}] Write complete: {} bytes written", dev_str, written);
-    Ok(())
 }
 
 fn verify_image(image: &Path, device: &Path) -> Result<bool, Box<dyn std::error::Error>> {
