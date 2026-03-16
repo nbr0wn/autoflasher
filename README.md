@@ -5,5 +5,5 @@ It has a watch mode which will detect udev changes and print them, but do nothin
 It has a flash mode which will detect udev changes and attempt to write the given image to them IF:
 
 - The device was not present when the program started - only new devices will be considered
-- The device type matches (ata, usb, sd etc.)
+- The device type matches SD, DISK, ATA, or one of those if specified on the command line.
 
