@@ -1,4 +1,4 @@
-I needed something to bulk flash an image to a bunch of SD cards, so I whipped this thing up.
+I needed something to bulk flash an image to a bunch of SD cards, so I whipped this thing up.  It waits for devices to be connected and then writes the given image to them if they meet the specified criteria.
 
 It has a watch mode which will detect udev changes and print them, but do nothing else.
 
