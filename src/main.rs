@@ -2,11 +2,12 @@ use clap::{Parser, Subcommand};
 use log::{error, info, warn};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
-use std::fs::{self, File};
-use std::io::{self, BufRead, BufReader, Write};
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, BufRead, BufReader, Read as _, Seek, SeekFrom, Write};
+use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command};
+use std::thread::{self, JoinHandle};
 
 /// Monitors udev for storage media insertions and automatically writes an image using dd.
 #[derive(Parser, Debug)]
@@ -39,10 +40,6 @@ enum Cmd {
         /// Only watch for this media type: usb, sd, ata, scsi, nvme
         #[arg(short, long)]
         media_type: Option<String>,
-
-        /// Block size for dd (default: 256M)
-        #[arg(long, default_value = "256M")]
-        bs: String,
 
         /// Exit after the first successful write
         #[arg(long, default_value_t = false)]
@@ -97,7 +94,6 @@ struct FlashConfig {
     image: PathBuf,
     no_confirm: bool,
     skip_verify: bool,
-    bs: String,
     once: bool,
 }
 
@@ -110,9 +106,9 @@ struct MonitorConfig {
     flash: Option<FlashConfig>,
 }
 
-/// A dd child process writing to a device.
+/// A write thread flashing an image to a device.
 struct InFlightOp {
-    child: Child,
+    handle: JoinHandle<Result<(), String>>,
     devnode: PathBuf,
     image: PathBuf,
     skip_verify: bool,
@@ -131,7 +127,6 @@ fn main() {
             skip_verify,
             device,
             media_type,
-            bs,
             once,
             verbose,
             show_partitions,
@@ -166,7 +161,6 @@ fn main() {
                     image,
                     no_confirm,
                     skip_verify,
-                    bs,
                     once,
                 }),
             }
@@ -265,23 +259,22 @@ fn enumerate_existing_devices() -> Result<HashSet<DeviceKey>, Box<dyn std::error
     Ok(existing)
 }
 
-/// Reap finished dd processes: log results and run verification.
+/// Reap finished write threads: log results and run verification.
 fn reap_children(in_flight: &mut HashMap<String, InFlightOp>) -> bool {
     let mut finished: Vec<String> = Vec::new();
     let mut got_once = false;
 
     for (dev, op) in in_flight.iter_mut() {
-        match op.child.try_wait() {
-            Ok(Some(status)) => {
-                finished.push(dev.clone());
-                if !status.success() {
-                    error!(
-                        "Failed to write to {}: dd exited with status {}",
-                        dev,
-                        status.code().map_or("signal".to_string(), |c| c.to_string())
-                    );
-                    continue;
-                }
+        if !op.handle.is_finished() {
+            continue;
+        }
+        finished.push(dev.clone());
+    }
+
+    for dev in &finished {
+        let op = in_flight.remove(dev).unwrap();
+        match op.handle.join() {
+            Ok(Ok(())) => {
                 info!("Successfully wrote image to {}", dev);
 
                 if !op.skip_verify {
@@ -302,16 +295,13 @@ fn reap_children(in_flight: &mut HashMap<String, InFlightOp>) -> bool {
                     got_once = true;
                 }
             }
-            Ok(None) => {} // still running
-            Err(e) => {
-                finished.push(dev.clone());
-                error!("Error waiting on dd for {}: {}", dev, e);
+            Ok(Err(e)) => {
+                error!("Failed to write to {}: {}", dev, e);
+            }
+            Err(_) => {
+                error!("Write thread for {} panicked!", dev);
             }
         }
-    }
-
-    for dev in finished {
-        in_flight.remove(&dev);
     }
 
     got_once
@@ -548,27 +538,23 @@ fn monitor(config: &MonitorConfig) -> Result<(), Box<dyn std::error::Error>> {
 
                 let image_size = fs::metadata(&flash.image)?.len();
                 info!(
-                    "Writing {} ({} bytes) -> {} (bs={})",
+                    "Writing {} ({} bytes) -> {}",
                     flash.image.display(),
                     image_size,
                     dev_str,
-                    flash.bs
                 );
 
-                // Fork+exec dd directly — no threads.
-                let child = Command::new("dd")
-                    .arg(format!("if={}", flash.image.display()))
-                    .arg(format!("of={}", devnode.display()))
-                    .arg(format!("bs={}", flash.bs))
-                    .arg("conv=fdatasync")
-                    .arg("status=progress")
-                    .stdin(std::process::Stdio::null())
-                    .spawn()?;
+                let thread_image = flash.image.clone();
+                let thread_dev = devnode.clone();
+                let thread_dev_str = dev_str.clone();
+                let handle = thread::spawn(move || {
+                    write_image(&thread_image, &thread_dev, &thread_dev_str)
+                });
 
                 in_flight.insert(
                     dev_str.clone(),
                     InFlightOp {
-                        child,
+                        handle,
                         devnode: devnode.clone(),
                         image: flash.image.clone(),
                         skip_verify: flash.skip_verify,
@@ -578,6 +564,119 @@ fn monitor(config: &MonitorConfig) -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     }
+}
+
+const CHUNK_SIZE: usize = 16 * 1024; // 16K
+const MAX_RETRIES: u32 = 10;
+const RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Open the output device with O_DIRECT | O_SYNC.
+fn open_output_device(path: &Path) -> Result<File, io::Error> {
+    OpenOptions::new()
+        .write(true)
+        .custom_flags(libc::O_DIRECT | libc::O_SYNC)
+        .open(path)
+}
+
+/// Write an image file to a device in 16K chunks.
+/// On write error, close/reopen the device and retry up to 10 times.
+/// Prints "device: progress%" to stdout.
+fn write_image(image: &Path, device: &Path, dev_label: &str) -> Result<(), String> {
+    let image_size = fs::metadata(image)
+        .map_err(|e| format!("failed to stat image: {}", e))?
+        .len();
+
+    let mut src = File::open(image)
+        .map_err(|e| format!("failed to open image: {}", e))?;
+
+    let mut dst = open_output_device(device)
+        .map_err(|e| format!("failed to open device: {}", e))?;
+
+    // O_DIRECT requires page-aligned buffers. Allocate with proper alignment.
+    let align = 4096usize;
+    let layout = std::alloc::Layout::from_size_align(CHUNK_SIZE, align)
+        .map_err(|e| format!("layout error: {}", e))?;
+    let buf_ptr = unsafe { std::alloc::alloc(layout) };
+    if buf_ptr.is_null() {
+        return Err("failed to allocate aligned buffer".to_string());
+    }
+    let buf = unsafe { std::slice::from_raw_parts_mut(buf_ptr, CHUNK_SIZE) };
+
+    let mut written: u64 = 0;
+    let mut retries: u32 = 0;
+    let mut last_pct: u64 = u64::MAX; // force first print
+
+    let result = loop {
+        let n = match src.read(buf) {
+            Ok(0) => break Ok(()),
+            Ok(n) => n,
+            Err(e) => break Err(format!("failed to read image: {}", e)),
+        };
+
+        // O_DIRECT requires writes to be sector-aligned in size.
+        // Pad the final chunk up to a 512-byte boundary.
+        let write_len = if n % 512 != 0 {
+            let padded = (n + 511) & !511;
+            // zero out the padding bytes
+            for b in &mut buf[n..padded] {
+                *b = 0;
+            }
+            padded
+        } else {
+            n
+        };
+
+        if let Err(e) = dst.write_all(&buf[..write_len]) {
+            error!("{}: write error at offset {}: {}", dev_label, written, e);
+            retries += 1;
+            if retries > MAX_RETRIES {
+                break Err(format!(
+                    "aborting after {} retries, last error: {}",
+                    MAX_RETRIES, e
+                ));
+            }
+            // Close, wait, reopen, seek, and retry this chunk.
+            drop(dst);
+            warn!(
+                "{}: retry {}/{} — waiting {}s...",
+                dev_label,
+                retries,
+                MAX_RETRIES,
+                RETRY_DELAY.as_secs()
+            );
+            thread::sleep(RETRY_DELAY);
+            dst = match open_output_device(device) {
+                Ok(f) => f,
+                Err(e2) => {
+                    break Err(format!("failed to reopen device on retry: {}", e2));
+                }
+            };
+            if let Err(e2) = dst.seek(SeekFrom::Start(written)) {
+                break Err(format!("failed to seek on retry: {}", e2));
+            }
+            // Also rewind the source to re-read this chunk.
+            if let Err(e2) = src.seek(SeekFrom::Start(written)) {
+                break Err(format!("failed to seek source on retry: {}", e2));
+            }
+            continue;
+        }
+
+        written += n as u64;
+
+        // Print progress
+        let pct = if image_size > 0 {
+            (written * 100) / image_size
+        } else {
+            100
+        };
+        if pct != last_pct {
+            println!("{}: {}%", dev_label, pct);
+            last_pct = pct;
+        }
+    };
+
+    unsafe { std::alloc::dealloc(buf_ptr, layout) };
+    result
 }
 
 fn format_size_from_sectors(sectors: Option<u64>) -> String {
